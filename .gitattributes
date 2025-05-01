@@ -1,0 +1,11 @@
+# Chuẩn hóa tất cả file text dùng LF (trừ file đặc biệt)
+* text=auto eol=lf
+*.java text eol=lf
+# File Maven Wrapper
+/mvnw text eol=lf
+*.cmd text eol=crlf
+
+# File nhị phân không xử lý line endings
+*.png binary
+*.jpg binary
+*.jar binary
