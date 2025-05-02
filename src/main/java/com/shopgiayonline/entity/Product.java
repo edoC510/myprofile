@@ -1,13 +1,16 @@
 package com.shopgiayonline.entity;
 
 import java.util.List;
-import java.util.UUID;
 
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
-import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToMany;
@@ -27,30 +30,40 @@ import lombok.Setter;
 @Builder
 public class Product extends BaseEntity {
 
-    @Builder.Default
-    @Column(name = "product_id", nullable = false, unique = true)
-    private UUID productId = UUID.randomUUID();
+    @Column(name = "product_code")
+    private String productCode;
 
-    @Column(nullable = false, length = 255)
     private String name;
 
+    @Column(length = 10000)
     private String description;
 
-    @Column(name = "main_image", nullable = false, length = 255)
-    private String mainImage;
+    @Column(name = "image")
+    private String image;
 
     @Builder.Default
     private Short status = 1; // 0: Deleted, 1: Active
 
-    @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OneToMany(mappedBy = "product", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
     private List<ProductVariant> productVariants;
 
+    @JsonIgnore
+    @OneToMany(mappedBy = "product", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
+    private List<Image> images;
+
+    @JsonIgnore
+    @OneToMany(mappedBy = "product", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
+    private List<Comment> comments;
+
     @ManyToOne
-    @JoinColumn(name = "brand_id", nullable = false)
+    @JoinColumn(name = "brand_id")
     private Brand brand;
 
     @ManyToOne
-    @JoinColumn(name = "category_id", nullable = false)
+    @JoinColumn(name = "category_id")
     private Category category;
 
     @ManyToOne

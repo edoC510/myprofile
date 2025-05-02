@@ -2,7 +2,6 @@ package com.shopgiayonline.infrastructure.authentication;
 
 import java.util.Collections;
 
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -17,11 +16,13 @@ import com.shopgiayonline.entity.User;
 @Component
 public class Authentication implements AuthenticationProvider {
 
-    @Autowired
-    private AdminUserRepository userRepo;
+    private final AdminUserRepository userRepo;
+    private final PasswordEncoder passwordEncoder;
 
-    @Autowired
-    private PasswordEncoder passwordEncoder;
+    public Authentication(AdminUserRepository userRepo, PasswordEncoder passwordEncoder) {
+        this.userRepo = userRepo;
+        this.passwordEncoder = passwordEncoder;
+    }
 
     @Override
     public org.springframework.security.core.Authentication authenticate(

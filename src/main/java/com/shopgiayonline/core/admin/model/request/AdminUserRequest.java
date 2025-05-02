@@ -53,7 +53,7 @@ public class AdminUserRequest implements DtoToEntity<User> {
         user.setName(this.getName());
         user.setUsername(this.getUsername());
         user.setStatus(this.getStatus());
-        user.setCreatedAt(this.getCreatedAt());
+        user.setCreatedAt(LocalDateTime.now());
         user.setPassword(passwordEncoder.encode(this.getPassword()));
         user.setDob(this.getDob());
         user.setAvatarUrl(this.getAvatarUrl());

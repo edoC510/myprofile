@@ -4,7 +4,6 @@ import java.util.HashMap;
 import java.util.List;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -26,11 +25,7 @@ import com.shopgiayonline.entity.User;
 @RequestMapping("/api/admin/user")
 public class AdminUserController {
     @Autowired
-    private final AdminUserService adminUserService;
-
-    public AdminUserController(@Qualifier("adminUserService") AdminUserService adminUserService) {
-        this.adminUserService = adminUserService;
-    }
+    AdminUserService adminUserService;
 
     @GetMapping("/getAllUser")
     public List<AdminUserResponse> getAllUser() {

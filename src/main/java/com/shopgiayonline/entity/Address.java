@@ -2,6 +2,10 @@ package com.shopgiayonline.entity;
 
 import java.util.List;
 
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.shopgiayonline.common.enums.AddressType;
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
@@ -9,6 +13,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToMany;
@@ -28,25 +33,25 @@ import lombok.Setter;
 @Builder
 public class Address extends BaseEntity {
 
-    @Column(name = "address_line", nullable = false, length = 1000)
+    @Column(name = "address_line", length = 10000)
     private String addressLine;
 
-    @Column(name = "ward_id", length = 50)
+    @Column(name = "ward_id")
     private String wardId;
 
-    @Column(name = "district_id", length = 50)
-    private String districtId;
+    @Column(name = "district_id")
+    private Integer districtId;
 
-    @Column(name = "province_id", length = 50)
-    private String provinceId;
+    @Column(name = "province_id")
+    private Integer provinceId;
 
-    @Column(name = "ward_name", length = 255)
+    @Column(name = "ward_name")
     private String wardName;
 
-    @Column(name = "district_name", length = 255)
+    @Column(name = "district_name")
     private String districtName;
 
-    @Column(name = "province_name", length = 255)
+    @Column(name = "province_name")
     private String provinceName;
 
     @Builder.Default
@@ -59,9 +64,11 @@ public class Address extends BaseEntity {
     private Boolean isDefault = false;
 
     @ManyToOne
-    @JoinColumn(name = "user_id", nullable = false)
+    @JoinColumn(name = "user_id")
     private User user;
 
-    @OneToMany(mappedBy = "address")
+    @JsonIgnore
+    @OneToMany(mappedBy = "address", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
     private List<Order> orders;
 }

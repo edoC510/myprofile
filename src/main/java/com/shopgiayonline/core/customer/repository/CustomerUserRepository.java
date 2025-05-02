@@ -4,12 +4,15 @@ import java.util.Optional;
 
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
 
 import com.shopgiayonline.core.customer.model.response.CustomerUserResponse;
 import com.shopgiayonline.entity.User;
 import com.shopgiayonline.repository.UserRepository;
 
+@Repository
 public interface CustomerUserRepository extends UserRepository {
+
     User findAllByUsername(String username);
 
     User findUserByEmail(String email);
@@ -25,8 +28,8 @@ public interface CustomerUserRepository extends UserRepository {
                    u.password as password, u.role as role, u.phone as phone,
                    u.name as name, u.status as status, u.username as username,
                    COUNT(hd.id) AS orderCount
-            FROM ShopGiayOnline.users u
-            LEFT JOIN ShopGiayOnline.orders hd ON u.id = hd.user_id
+            FROM users u
+            LEFT JOIN orders hd ON u.id = hd.user_id
             WHERE u.id =:id
             GROUP BY u.id, u.avatar_url, u.email, u.gender, u.user_id, u.dob, u.password, u.role, u.phone, u.name, u.status, u.username;
             """, nativeQuery = true)

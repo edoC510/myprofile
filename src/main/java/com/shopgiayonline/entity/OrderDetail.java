@@ -1,7 +1,6 @@
 package com.shopgiayonline.entity;
 
 import java.math.BigDecimal;
-import java.util.UUID;
 
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
@@ -25,19 +24,17 @@ import lombok.Setter;
 @Builder
 public class OrderDetail extends BaseEntity {
 
-    @Builder.Default
-    @Column(name = "order_detail_id", nullable = false, unique = true)
-    private UUID orderDetailId = UUID.randomUUID();
+    @Column(name = "order_detail_code")
+    private String orderDetailCode;
 
-    @Column(name = "unit_price", nullable = false, precision = 15, scale = 2)
+    @Column(name = "unit_price", precision = 15, scale = 2)
     private BigDecimal unitPrice;
 
     @Column(nullable = false)
     private Integer quantity;
 
-    @Builder.Default
     @Column(name = "product_discount", precision = 15, scale = 2)
-    private BigDecimal productDiscount = BigDecimal.ZERO;
+    private BigDecimal productDiscount;
 
     private String reason;
 
@@ -46,10 +43,10 @@ public class OrderDetail extends BaseEntity {
                               // vận chuyển, 6: Đang giao, 7: Đổi trả, 8: Xác nhận
                               // đổi trả, 9: Hủy đổi trả
     @ManyToOne
-    @JoinColumn(name = "order_id", nullable = false)
+    @JoinColumn(name = "order_id")
     private Order order;
 
     @ManyToOne
-    @JoinColumn(name = "product_variant_id", nullable = false)
+    @JoinColumn(name = "product_variant_id")
     private ProductVariant productVariant;
 }

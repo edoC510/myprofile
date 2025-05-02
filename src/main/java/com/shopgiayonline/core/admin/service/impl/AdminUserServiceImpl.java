@@ -1,9 +1,9 @@
 package com.shopgiayonline.core.admin.service.impl;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
@@ -14,17 +14,14 @@ import com.shopgiayonline.core.admin.repository.AdminUserRepository;
 import com.shopgiayonline.core.admin.service.AdminUserService;
 import com.shopgiayonline.entity.User;
 
-@Service
+@Service("adminUserService")
 public class AdminUserServiceImpl implements AdminUserService {
-    @Autowired
-    private final AdminUserRepository adminUserRepository;
 
-    public AdminUserServiceImpl(@Qualifier("adminUserRepository") AdminUserRepository adminUserRepository) {
-        this.adminUserRepository = adminUserRepository;
-    }
+    @Autowired
+    AdminUserRepository adminUserRepository;
 
     public List<AdminUserResponse> getCustomer() {
-        return adminUserRepository.findUserByRole("USER");
+        return adminUserRepository.findUserByRole("CUSTOMER");
     }
 
     public List<AdminUserResponse> getEmployee() {
@@ -57,6 +54,7 @@ public class AdminUserServiceImpl implements AdminUserService {
         User user = adminUserRepository.findById(id).get();
         if (user != null) {
             user.setEmail(request.getEmail());
+            user.setUpdatedAt(LocalDateTime.now());
             user.setName(request.getName());
             user.setDob(request.getDob());
             user.setPhone(request.getPhone());

@@ -2,10 +2,15 @@ package com.shopgiayonline.entity;
 
 import java.util.List;
 
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
@@ -23,12 +28,16 @@ import lombok.Setter;
 @Builder
 public class Category extends BaseEntity {
 
-    @Column(nullable = false, unique = true, length = 255)
     private String name;
+
+    @Column(name = "category_code")
+    private String categoryCode;
 
     @Builder.Default
     private Short status = 1; // 0: Deleted, 1: Active
 
-    @OneToMany(mappedBy = "category")
+    @JsonIgnore
+    @OneToMany(mappedBy = "category", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
     private List<Product> products;
 }

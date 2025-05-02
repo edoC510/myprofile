@@ -1,13 +1,16 @@
 package com.shopgiayonline.entity;
 
 import java.util.List;
-import java.util.UUID;
 
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
-import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToMany;
@@ -27,17 +30,18 @@ import lombok.Setter;
 @Builder
 public class Cart extends BaseEntity {
 
-    @Builder.Default
-    @Column(name = "cart_id", nullable = false, unique = true)
-    private UUID cartId = UUID.randomUUID();
+    @Column(name = "cart_code")
+    private String cartCode;
 
     @Builder.Default
     private Short status = 1; // 0: Canceled, 1: Active
 
     @ManyToOne
-    @JoinColumn(name = "user_id", nullable = false)
+    @JoinColumn(name = "user_id")
     private User user;
 
-    @OneToMany(mappedBy = "cart", cascade = CascadeType.ALL, orphanRemoval = true)
+    @JsonIgnore
+    @OneToMany(mappedBy = "cart", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
     private List<CartDetail> cartDetails;
 }

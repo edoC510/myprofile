@@ -30,20 +30,18 @@ public class Token {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Integer id;
 
-    @Column(nullable = false, unique = true, length = 255)
+    @Column(unique = true)
     private String token;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "token_type", nullable = false)
+    @Column(name = "token_type")
     private TokenType tokenType;
 
-    @Builder.Default
-    private Boolean revoked = false;
+    private Boolean revoked;
 
-    @Builder.Default
-    private Boolean expired = false;
+    private Boolean expired;
 
     @ManyToOne
-    @JoinColumn(name = "user_id", nullable = false)
+    @JoinColumn(name = "user_id")
     private User user;
 }

@@ -4,10 +4,13 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 
-import com.shopgiayonline.entity.BaseEntity.BaseEntity;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
@@ -23,34 +26,34 @@ import lombok.Setter;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class Voucher extends BaseEntity {
+public class Voucher {
 
-    @Column(name = "voucher_id", nullable = false, unique = true, length = 50)
-    private String voucherId;
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
 
     @Column(name = "max_discount", precision = 15, scale = 2)
     private BigDecimal maxDiscount;
 
-    @Column(name = "discount_value", nullable = false, precision = 15, scale = 2)
+    @Column(name = "discount_value", precision = 15, scale = 2)
     private BigDecimal discountValue;
 
-    @Column(nullable = false, length = 255)
     private String name;
 
+    @Column(length = 10000)
     private String description;
 
-    @Column(nullable = false)
     private Integer quantity;
 
-    @Column(name = "start_date", nullable = false)
+    @Column(name = "start_date")
     private LocalDateTime startDate;
 
-    @Column(name = "end_date", nullable = false)
+    @Column(name = "end_date")
     private LocalDateTime endDate;
 
-    @Builder.Default
-    private Short status = 1; // 0: Inactive/Expired, 1: Active
+    private Short status; // 0: Inactive/Expired, 1: Active
 
+    @JsonIgnore
     @OneToMany(mappedBy = "voucher")
     private List<Order> orders;
 }

@@ -1,14 +1,11 @@
 package com.shopgiayonline.entity;
 
-import java.util.List;
-
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
-import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -25,24 +22,20 @@ import lombok.Setter;
 @Builder
 public class Comment extends BaseEntity {
 
-    @Column(nullable = false)
+    @Column(length = 10000)
     private String content;
 
     @Builder.Default
     private Short status = 1; // 0: Hidden/Deleted, 1: Active
 
+    @Column(name = "id_reply")
+    private Integer idReply;
+
     @ManyToOne
-    @JoinColumn(name = "user_id", nullable = false)
+    @JoinColumn(name = "user_id")
     private User user;
 
     @ManyToOne
-    @JoinColumn(name = "product_variant_id", nullable = false)
-    private ProductVariant productVariant;
-
-    @ManyToOne
-    @JoinColumn(name = "reply_comment_id")
-    private Comment replyComment;
-
-    @OneToMany(mappedBy = "replyComment")
-    private List<Comment> replies;
+    @JoinColumn(name = "product_id")
+    private Product product;
 }

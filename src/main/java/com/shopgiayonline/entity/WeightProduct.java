@@ -1,18 +1,18 @@
 package com.shopgiayonline.entity;
 
-import java.math.BigDecimal;
 import java.util.List;
 
-import com.shopgiayonline.common.enums.WeightUnit;
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
-import jakarta.persistence.UniqueConstraint;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -20,23 +20,26 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 @Entity
-@Table(name = "weights", uniqueConstraints = @UniqueConstraint(columnNames = { "value", "unit" }))
+@Table(name = "weights")
 @Getter
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
 public class WeightProduct extends BaseEntity {
-    @Column(nullable = false, precision = 10, scale = 2)
-    private BigDecimal value;
 
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
-    private WeightUnit unit;
+    private Integer value;
+
+    @Column(name = "weight_code")
+    private String weightCode;
+
+    private String unit;
 
     @Builder.Default
     private Short status = 1; // 0: Deleted, 1: Active
 
-    @OneToMany(mappedBy = "weight")
+    @JsonIgnore
+    @OneToMany(mappedBy = "weight", fetch = FetchType.EAGER)
+    @Fetch(value = FetchMode.SUBSELECT)
     private List<ProductVariant> productVariants;
 }

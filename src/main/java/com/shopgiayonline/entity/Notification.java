@@ -2,7 +2,6 @@ package com.shopgiayonline.entity;
 
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
-import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
@@ -25,14 +24,12 @@ public class Notification extends BaseEntity {
     @Builder.Default
     private Short status = 1; // 0: Read, 1: Unread
 
-    @Column(nullable = false)
     private Short type; // 0: Payment, 1: Confirmation_order, ...
 
     @ManyToOne
     @JoinColumn(name = "product_variant_id")
     private ProductVariant productVariant;
 
-    @Column(nullable = false)
     private String content;
 
     @ManyToOne

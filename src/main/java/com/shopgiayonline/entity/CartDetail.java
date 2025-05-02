@@ -1,7 +1,6 @@
 package com.shopgiayonline.entity;
 
 import java.math.BigDecimal;
-import java.util.UUID;
 
 import com.shopgiayonline.entity.BaseEntity.BaseEntity;
 
@@ -25,24 +24,23 @@ import lombok.Setter;
 @Builder
 public class CartDetail extends BaseEntity {
 
-    @Builder.Default
-    @Column(name = "cart_detail_id", nullable = false, unique = true)
-    private UUID cartDetailId = UUID.randomUUID();
+    @Column(name = "cart_detail_code")
+    private String cartDetailCode;
 
-    @Column(name = "unit_price", nullable = false, precision = 15, scale = 2)
+    @Column(name = "unit_price", precision = 15, scale = 2)
     private BigDecimal unitPrice;
 
-    @Column(nullable = false)
+    @Column(name = "quantity")
     private Integer quantity;
 
     @Builder.Default
     private Short status = 1; // 0: Canceled, 1: Active
 
     @ManyToOne
-    @JoinColumn(name = "cart_id", nullable = false)
+    @JoinColumn(name = "cart_id")
     private Cart cart;
 
     @ManyToOne
-    @JoinColumn(name = "product_variant_id", nullable = false)
+    @JoinColumn(name = "product_variant_id")
     private ProductVariant productVariant;
 }
