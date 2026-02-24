@@ -1,25 +1,38 @@
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Depends, Security, Body
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
+from pydantic import BaseModel
 from database import db
-from rollback import rollback_manager
+from windows_rollback import rollback_manager
 from linux_rollback import linux_rollback_manager
+from system_backup import system_backup_manager
 
 import time
 import traceback
 import os
 from datetime import datetime
+import re
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Import từ các module mới
 from utils import load_rules, load_rules_by_os, load_remediation_script, load_windows_remediation_script
 from linux_audit import detect_os, ssh_connect, run_bash_check_stdin, truncate_output, get_linux_host_info
 from windows_audit import winrm_connect, run_winrm_audit, get_windows_host_info, detect_os_windows
-from auth import auth_manager, RequireAuth
+from auth import auth_manager, RequireAuth, API_KEY_HEADER
+from users import user_manager
+
+# Define API_KEY_HEADER for admin check
+if 'API_KEY_HEADER' not in globals():
+    API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Đường dẫn đến dashboard
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 DASHBOARD_DIR = os.path.join(REPO_ROOT, "dashboard")
+DASHBOARD_DIST = os.path.join(DASHBOARD_DIR, "dist")
 
 app = FastAPI(
     title="Security Hardening Audit Engine",
@@ -29,23 +42,152 @@ app = FastAPI(
     },
 )
 
-# Serve dashboard static files
-if os.path.exists(DASHBOARD_DIR):
-    app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
-    
-    @app.get("/")
-    async def root_redirect():
-        """Redirect root to dashboard."""
-        return FileResponse(os.path.join(DASHBOARD_DIR, "index.html"))
+# CORS middleware - Allow dashboard to make API calls
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/")
-async def root():
-    """Root endpoint - API information and quick links."""
+# Scheduled task để tự động xóa backup cũ hơn 7 ngày
+scheduler = BackgroundScheduler()
+
+def cleanup_old_backups_job():
+    """Job tự động xóa backup cũ hơn 7 ngày."""
+    try:
+        print("🧹 Running scheduled backup cleanup...")
+        deleted_count = db.cleanup_old_backups(days=7)
+        print(f"✅ Cleanup completed: {deleted_count} backups deleted")
+    except Exception as e:
+        print(f"❌ Scheduled cleanup failed: {e}")
+
+def run_scheduled_backups_job():
+    """Job chạy scheduled system backups."""
+    try:
+        print("🔄 Running scheduled system backups...")
+        schedules = db.get_backup_schedules()
+        enabled_schedules = [s for s in schedules if s.get("enabled", True)]
+        
+        from datetime import datetime
+        now = datetime.utcnow()
+        current_hour = now.hour
+        current_minute = now.minute
+        current_day = now.weekday()  # 0 = Monday, 6 = Sunday
+        current_date = now.day
+        
+        for schedule in enabled_schedules:
+            try:
+                schedule_time = schedule.get("time", "02:00")
+                schedule_type = schedule.get("scheduleType", "daily")
+                time_parts = schedule_time.split(":")
+                schedule_hour = int(time_parts[0])
+                schedule_minute = int(time_parts[1])
+                
+                should_run = False
+                
+                if schedule_type == "daily":
+                    # Chạy mỗi ngày tại thời điểm chỉ định
+                    should_run = (current_hour == schedule_hour and current_minute == schedule_minute)
+                elif schedule_type == "weekly":
+                    # Chạy mỗi tuần vào thứ 2 (Monday) tại thời điểm chỉ định
+                    should_run = (current_day == 0 and current_hour == schedule_hour and current_minute == schedule_minute)
+                elif schedule_type == "monthly":
+                    # Chạy mỗi tháng vào ngày 1 tại thời điểm chỉ định
+                    should_run = (current_date == 1 and current_hour == schedule_hour and current_minute == schedule_minute)
+                
+                if should_run:
+                    print(f"🔄 Running scheduled backup for {schedule.get('host')}...")
+                    os_type = schedule.get("osType", "linux")
+                    
+                    if os_type == "linux" or os_type.startswith("ubuntu") or os_type.startswith("debian"):
+                        backup_id = system_backup_manager.create_linux_system_backup(
+                            schedule.get("host"),
+                            schedule.get("username", ""),
+                            schedule.get("key_path", "~/.ssh/id_ed25519"),
+                            schedule.get("password"),
+                            schedule.get("sudo_password")
+                        )
+                    else:
+                        backup_id = system_backup_manager.create_windows_system_backup(
+                            schedule.get("host"),
+                            schedule.get("username", "Administrator"),
+                            schedule.get("password")
+                        )
+                    
+                    if backup_id:
+                        print(f"✅ Scheduled backup created: {backup_id}")
+                    else:
+                        print(f"⚠️ Scheduled backup failed for {schedule.get('host')}")
+            except Exception as schedule_error:
+                print(f"❌ Error running scheduled backup for {schedule.get('host')}: {schedule_error}")
+        
+        print(f"✅ Scheduled backups check completed")
+    except Exception as e:
+        print(f"❌ Scheduled backups job failed: {e}")
+
+# Schedule cleanup job chạy mỗi ngày lúc 2:00 AM
+scheduler.add_job(
+    cleanup_old_backups_job,
+    trigger=CronTrigger(hour=2, minute=0),
+    id='cleanup_old_backups',
+    name='Cleanup backups older than 7 days',
+    replace_existing=True
+)
+
+# Schedule backup job chạy mỗi phút để check scheduled backups
+scheduler.add_job(
+    run_scheduled_backups_job,
+    trigger=CronTrigger(minute='*'),  # Chạy mỗi phút
+    id='run_scheduled_backups',
+    name='Run scheduled system backups',
+    replace_existing=True
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Khởi động scheduler khi app start."""
+    scheduler.start()
+    print("✅ Background scheduler started - Backup cleanup scheduled daily at 2:00 AM")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Dừng scheduler khi app shutdown."""
+    scheduler.shutdown()
+    print("✅ Background scheduler stopped")
+
+# Serve React dashboard (production build) - Priority 1
+# Note: Dashboard routes will be registered at the END of file to avoid conflicts with API routes
+DASHBOARD_BUILT = os.path.exists(DASHBOARD_DIST)
+if DASHBOARD_BUILT:
+    # Serve static assets (JS, CSS, images) - must be before catch-all route
+    assets_dir = os.path.join(DASHBOARD_DIST, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="dashboard-assets")
+
+# Fallback: Serve old HTML dashboard if React build doesn't exist
+elif os.path.exists(os.path.join(DASHBOARD_DIR, "index.html")):
+    app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard-old")
+
+# API Info endpoint (accessible even when dashboard is served at root)
+@app.get("/api/info")
+async def root_api_info():
+    """API information and quick links."""
     has_keys = auth_manager.has_any_active_keys()
+    
+    # Determine dashboard URL
+    dashboard_url = None
+    if os.path.exists(DASHBOARD_DIST):
+        dashboard_url = "/"
+    elif os.path.exists(os.path.join(DASHBOARD_DIR, "index.html")):
+        dashboard_url = "/dashboard"
+    
     return {
         "name": "Security Hardening Agentless API",
         "version": "1.0.0",
         "description": "API for agentless security hardening audit and remediation",
+        "dashboard": dashboard_url,
         "authentication": {
             "required": True,
             "method": "API Key (X-API-Key header)",
@@ -63,7 +205,8 @@ async def root():
             },
             "audit": {
                 "linux": "/audit/linux",
-                "windows": "/audit/windows"
+                "windows": "/audit/windows",
+                "container": "/audit/container"
             },
             "remediation": {
                 "linux": "/remediate/linux",
@@ -72,6 +215,10 @@ async def root():
             "rollback": {
                 "linux": "/rollback/linux",
                 "windows": "/rollback/windows"
+            },
+            "test_connection": {
+                "linux": "/test/connection/linux",
+                "windows": "/test/connection/windows"
             },
             "reports": {
                 "audits": "/reports/audits",
@@ -82,10 +229,33 @@ async def root():
         }
     }
 
-@app.post("/audit/windows", dependencies=[RequireAuth])
+# Fallback: Root endpoint returns API info when dashboard not built
+if not os.path.exists(DASHBOARD_DIST):
+    @app.get("/", name="root_api_info_fallback")
+    async def root():
+        """Root endpoint - API information (fallback when dashboard not built)."""
+        return await root_api_info()
+
+async def require_admin(api_key: Optional[str] = Security(API_KEY_HEADER)) -> bool:
+    """Dependency để check admin role."""
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    if not auth_manager.verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    user_info = auth_manager.get_api_key_user(api_key)
+    if not user_info or user_info.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    return True
+
+RequireAdmin = Depends(require_admin)
+
+@app.post("/audit/windows", dependencies=[RequireAdmin])
 async def audit_windows_winrm(
     host: str = Form(...),
-    username: str = Form("Window"),
+    username: str = Form(""),
     password: str = Form(..., json_schema_extra={"format": "password"}),
 ):
     """Audit Windows using WinRM - Lưu kết quả vào MongoDB."""
@@ -222,7 +392,7 @@ async def get_rules(os_name: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/audit/linux", dependencies=[RequireAuth])
+@app.post("/audit/linux", dependencies=[RequireAdmin])
 async def audit_linux_json(
     Host: str = Form(...),
     Username: str = Form(""),
@@ -233,8 +403,31 @@ async def audit_linux_json(
 ):
     """Audit Linux: auto-detect OS và chạy tất cả CIS rules."""
     try:
+        # Validate inputs
+        if not Host or not Host.strip():
+            raise HTTPException(status_code=400, detail="Host is required")
+        if not Username or not Username.strip():
+            raise HTTPException(status_code=400, detail="Username is required. Please provide a valid username (not empty).")
+        
+        Host = Host.strip()
+        Username = Username.strip()
+        
         # Kết nối SSH trước để auto-detect OS
-        ssh = ssh_connect(Host, Username, Key_path or "", password=Password)
+        try:
+            ssh = ssh_connect(Host, Username, Key_path or "", password=Password)
+        except Exception as ssh_error:
+            error_msg = str(ssh_error)
+            if "Authentication" in error_msg or "authentication" in error_msg.lower():
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"SSH Authentication failed: {error_msg}. Please check your username, password, or SSH key."
+                )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"SSH connection failed: {error_msg}"
+                )
+        
         try:
             detected_os = detect_os(ssh)
             if not detected_os:
@@ -272,7 +465,15 @@ async def audit_linux_json(
                 print(f"    ⚠️ Skipped: no check.bash")
                 return {"id": rule_id, "title": rule_title, "status": "SKIPPED", "reason": "no check.bash"}
             
-            effective_use_sudo = bool(rule.get("needs_sudo", False) or Use_sudo)
+            # Auto-enable sudo if rule requires it
+            rule_needs_sudo = rule.get("needs_sudo", False)
+            effective_use_sudo = bool(rule_needs_sudo or Use_sudo)
+            
+            # Warn if sudo is needed but password not provided
+            if effective_use_sudo and not Sudo_password:
+                # Try to check if sudo works without password (NOPASSWD)
+                print(f"    ⚠️ Rule requires sudo but no password provided. Attempting sudo -n test...")
+            
             started = time.time()
             
             try:
@@ -286,6 +487,14 @@ async def audit_linux_json(
                         sudo_password=Sudo_password,
                         timeout=30,  # 30 seconds timeout cho audit checks
                     )
+                    
+                    # Check if failure is due to sudo password requirement
+                    if exec_result.get("exit_status") != 0 and effective_use_sudo:
+                        stderr_text = exec_result.get("stderr", "")
+                        if "sudo: a password is required" in stderr_text or "sudo: no password was provided" in stderr_text:
+                            print(f"    ⚠️ Sudo password required for this rule. Please provide sudo_password in audit request.")
+                            # Update stderr to be more helpful
+                            exec_result["stderr"] = f"Sudo password required. Please provide 'Sudo_password' parameter when running audit. Original error: {stderr_text}"
                 finally:
                     try:
                         ssh_local.close()
@@ -294,22 +503,39 @@ async def audit_linux_json(
                 
                 duration_ms = int((time.time() - started) * 1000)
                 
-                # Log kết quả
+                # Log kết quả với chi tiết hơn
                 if exec_result.get("status") == "TIMEOUT":
                     print(f"    ⚠️ TIMEOUT after 30s")
                 elif exec_result.get("exit_status") == 0:
                     print(f"    ✅ PASS ({duration_ms}ms)")
                 else:
                     print(f"    ❌ FAIL ({duration_ms}ms)")
+                    # Log chi tiết khi fail để debug
+                    if exec_result.get("stdout"):
+                        print(f"       stdout: {exec_result['stdout'][:200]}")
+                    if exec_result.get("stderr"):
+                        stderr_text = exec_result.get("stderr", "")
+                        print(f"       stderr: {stderr_text[:200]}")
+                        # Check if failure is due to sudo password requirement
+                        if effective_use_sudo and ("sudo: a password is required" in stderr_text or 
+                                                   "sudo: no password was provided" in stderr_text or
+                                                   "sudo: a password is required" in stderr_text.lower()):
+                            print(f"       ⚠️ SUDO PASSWORD REQUIRED for this rule!")
+                            # Update stderr to be more helpful
+                            exec_result["stderr"] = f"⚠️ Sudo password required. This rule needs sudo privileges. Please provide 'Sudo_password' parameter when running audit. Original error: {stderr_text}"
+                    print(f"       use_sudo: {effective_use_sudo}, rule_needs_sudo: {rule_needs_sudo}")
                 
                 tout_dict = truncate_output(exec_result["stdout"]) 
-                terr_dict = truncate_output(exec_result["stderr"]) 
-                return {
+                terr_dict = truncate_output(exec_result["stderr"])
+                
+                # Add helpful message if sudo password is needed
+                result_data = {
                     "id": rule_id,
                     "title": rule_title,
                     "os": rule.get("os"),
                     "benchmark": rule.get("benchmark"),
                     "needs_sudo": effective_use_sudo,
+                    "rule_requires_sudo": rule_needs_sudo,
                     "exit_status": exec_result["exit_status"],
                     "status": exec_result["status"],
                     "stdout": tout_dict.get("text", ""),
@@ -321,6 +547,15 @@ async def audit_linux_json(
                     "duration_ms": duration_ms,
                     "started_at": int(started * 1000),
                 }
+                
+                # Add warning if sudo password is needed
+                if exec_result.get("exit_status") != 0 and effective_use_sudo:
+                    stderr_text = terr_dict.get("text", "")
+                    if "sudo: a password is required" in stderr_text or "sudo: no password was provided" in stderr_text:
+                        result_data["sudo_password_required"] = True
+                        result_data["help_message"] = "This rule requires sudo privileges. Please enable 'Use sudo' and provide 'Sudo password' when running audit."
+                
+                return result_data
             except Exception as rule_error:
                 print(f"    ❌ ERROR: {str(rule_error)[:100]}")
                 return {
@@ -400,6 +635,434 @@ async def audit_linux_json(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)
 
+@app.post("/audit/container", dependencies=[RequireAdmin])
+async def audit_container_docker_exec(
+    Host: str = Form(...),
+    Username: str = Form(""),
+    Container_name: str = Form(...),
+    Key_path: Optional[str] = Form("~/.ssh/id_ed25519"),
+    Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Use_sudo_host: bool = Form(False),
+    Sudo_password_host: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+):
+    """
+    Audit container thông qua docker exec trên host Linux (SSH vào host, không cần SSH trong container).
+    """
+    try:
+        if not Host or not Host.strip():
+            raise HTTPException(status_code=400, detail="Host is required")
+        if not Username or not Username.strip():
+            raise HTTPException(status_code=400, detail="Username is required. Please provide a valid username (not empty).")
+        if not Container_name or not Container_name.strip():
+            raise HTTPException(status_code=400, detail="Container_name is required")
+
+        Host = Host.strip()
+        Username = Username.strip()
+        Container_name = Container_name.strip()
+
+        name_pattern = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+        if not name_pattern.match(Container_name):
+            raise HTTPException(status_code=400, detail="Invalid container name. Only letters, numbers, . _ - are allowed.")
+
+        # Kết nối host và kiểm tra container tồn tại
+        try:
+            ssh = ssh_connect(Host, Username, Key_path or "", password=Password)
+            try:
+                check_cmd = f"docker inspect {Container_name} >/dev/null 2>&1"
+                exists = run_bash_check_stdin(
+                    ssh,
+                    check_cmd,
+                    use_sudo=Use_sudo_host,
+                    sudo_password=Sudo_password_host,
+                    timeout=15,
+                )
+                if exists.get("exit_status") != 0:
+                    raise HTTPException(status_code=400, detail=f"Container '{Container_name}' not found on host {Host}")
+
+                inspect_cmd = (
+                    f"docker inspect --format '{{{{.Id}}}}|{{{{.Config.Image}}}}|{{{{.Config.User}}}}|{{{{.State.Running}}}}' {Container_name}"
+                )
+                inspect_res = run_bash_check_stdin(
+                    ssh,
+                    inspect_cmd,
+                    use_sudo=Use_sudo_host,
+                    sudo_password=Sudo_password_host,
+                    timeout=15,
+                )
+                container_info = {
+                    "id": None,
+                    "image": None,
+                    "user": None,
+                    "running": None,
+                }
+                if inspect_res.get("exit_status") == 0:
+                    parts = inspect_res.get("stdout", "").strip().split("|")
+                    if len(parts) >= 4:
+                        container_info = {
+                            "id": parts[0],
+                            "image": parts[1],
+                            "user": parts[2] or "root (default)",
+                            "running": parts[3],
+                        }
+            finally:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+        except HTTPException:
+            raise
+        except Exception as ssh_error:
+            raise HTTPException(status_code=400, detail=f"SSH connection failed: {ssh_error}")
+
+        # Load rules cho container
+        try:
+            rules = load_rules_by_os("container-linux")
+        except Exception as rules_error:
+            raise HTTPException(status_code=500, detail=f"Failed to load container rules: {rules_error}")
+
+        if not rules:
+            return {
+                "client_type": "container",
+                "host": Host,
+                "container": Container_name,
+                "os": "container-linux",
+                "total_rules": 0,
+                "results": [],
+            }
+
+        results: List[Dict] = []
+        start_overall = time.time()
+
+        def wrap_in_docker_exec(script_text: str) -> str:
+            """Wrap rule script để chạy trong container qua docker exec."""
+            return f"docker exec -i {Container_name} sh <<'EOF'\n{script_text}\nEOF\n"
+
+        def run_one(rule: Dict, rule_index: int, total_rules: int) -> Dict:
+            rule_id = rule.get("id", "unknown")
+            rule_title = rule.get("title", "Unknown")
+
+            print(f"  [{rule_index}/{total_rules}] Checking (container): {rule_id} - {rule_title}")
+
+            check = rule.get("check", {}) if isinstance(rule, dict) else {}
+            script_text = check.get("bash") if isinstance(check, dict) else None
+            if not script_text:
+                print(f"    ⚠️ Skipped: no check.bash")
+                return {"id": rule_id, "title": rule_title, "status": "SKIPPED", "reason": "no check.bash"}
+
+            started = time.time()
+            try:
+                ssh_local = ssh_connect(Host, Username, Key_path or "", password=Password)
+                try:
+                    docker_script = wrap_in_docker_exec(script_text)
+                    exec_result = run_bash_check_stdin(
+                        ssh_local,
+                        docker_script,
+                        use_sudo=Use_sudo_host,
+                        sudo_password=Sudo_password_host,
+                        timeout=30,
+                    )
+                finally:
+                    try:
+                        ssh_local.close()
+                    except Exception:
+                        pass
+
+                duration_ms = int((time.time() - started) * 1000)
+
+                if exec_result.get("status") == "TIMEOUT":
+                    print(f"    ⚠️ TIMEOUT after 30s")
+                elif exec_result.get("exit_status") == 0:
+                    print(f"    ✅ PASS ({duration_ms}ms)")
+                else:
+                    print(f"    ❌ FAIL ({duration_ms}ms)")
+                    if exec_result.get("stdout"):
+                        print(f"       stdout: {exec_result['stdout'][:200]}")
+                    if exec_result.get("stderr"):
+                        print(f"       stderr: {exec_result['stderr'][:200]}")
+
+                tout_dict = truncate_output(exec_result.get("stdout"))
+                terr_dict = truncate_output(exec_result.get("stderr"))
+
+                return {
+                    "id": rule_id,
+                    "title": rule_title,
+                    "os": "container-linux",
+                    "benchmark": rule.get("benchmark"),
+                    "needs_sudo": Use_sudo_host,
+                    "exit_status": exec_result.get("exit_status"),
+                    "status": exec_result.get("status"),
+                    "stdout": tout_dict.get("text", ""),
+                    "stdout_truncated": tout_dict.get("truncated", False),
+                    "stdout_sha256": tout_dict.get("sha256"),
+                    "stderr": terr_dict.get("text", ""),
+                    "stderr_truncated": terr_dict.get("truncated", False),
+                    "stderr_sha256": terr_dict.get("sha256"),
+                    "duration_ms": duration_ms,
+                    "started_at": int(started * 1000),
+                }
+            except Exception as rule_error:
+                print(f"    ❌ ERROR: {str(rule_error)[:100]}")
+                return {
+                    "id": rule_id,
+                    "title": rule_title,
+                    "status": "ERROR",
+                    "error": str(rule_error),
+                    "duration_ms": int((time.time() - started) * 1000),
+                }
+
+        print(f"🚀 Running {len(rules)} audit checks on container {Container_name} via host {Host}...")
+
+        for i, rule in enumerate(rules, 1):
+            try:
+                results.append(run_one(rule, i, len(rules)))
+            except Exception as e:
+                print(f"  ❌ Fatal error on rule {i}: {e}")
+                results.append({
+                    "id": rule.get("id", "unknown"),
+                    "title": rule.get("title", "Unknown"),
+                    "status": "ERROR",
+                    "error": str(e)
+                })
+
+        # Lấy thông tin host (Linux) để lưu kèm
+        ssh_info = ssh_connect(Host, Username, Key_path or "", password=Password)
+        try:
+            host_info = get_linux_host_info(ssh_info)
+        finally:
+            ssh_info.close()
+
+        audit_data = {
+            "host": Host,
+            "container": Container_name,
+            "os_type": "container-linux",
+            "client_type": "container",
+            "protocol": "docker-exec",
+            "benchmark": rules[0].get("benchmark", "Container Baseline") if rules else "Unknown",
+            "total_rules": len(results),
+            "results": results,
+            "connection_info": {
+                "host": host_info,
+                "container": container_info,
+            },
+            "duration_ms": int((time.time() - start_overall) * 1000)
+        }
+
+        try:
+            print("💾 Saving container audit results to MongoDB...")
+            audit_id = db.save_audit_report(audit_data)
+            print(f"✅ Audit saved to MongoDB: {audit_id}")
+        except Exception as db_error:
+            print(f"⚠️ MongoDB save failed (non-critical): {db_error}")
+            audit_id = None
+
+        return {
+            "audit_id": audit_id,
+            "client_type": "container",
+            "protocol": "docker-exec",
+            "host": Host,
+            "container": Container_name,
+            "os": "container-linux",
+            "benchmark": audit_data["benchmark"],
+            "total_rules": len(results),
+            "compliance_score": audit_data.get("compliance_score", 0),
+            "duration_ms": audit_data["duration_ms"],
+            "connection_info": audit_data["connection_info"],
+            "results": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Container audit failed: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/remediate/container", dependencies=[RequireAdmin])
+async def remediate_container(
+    Host: str = Form(...),
+    Username: str = Form(""),
+    Container_name: str = Form(...),
+    Key_path: Optional[str] = Form("~/.ssh/id_ed25519"),
+    Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Use_sudo_host: bool = Form(False),
+    Sudo_password_host: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Rule_id: str = Form(..., description="ID của rule container cần fix"),
+):
+    """
+    Chạy remediation script cho container (docker exec) dựa trên rule_id.
+    Scripts được lấy từ scripts/remediation/container-linux/.
+    """
+    try:
+        if not Host or not Host.strip():
+            raise HTTPException(status_code=400, detail="Host is required")
+        if not Username or not Username.strip():
+            raise HTTPException(status_code=400, detail="Username is required. Please provide a valid username (not empty).")
+        if not Container_name or not Container_name.strip():
+            raise HTTPException(status_code=400, detail="Container_name is required")
+        if not Rule_id or not Rule_id.strip():
+            raise HTTPException(status_code=400, detail="Rule_id is required")
+
+        Host = Host.strip()
+        Username = Username.strip()
+        Container_name = Container_name.strip()
+        Rule_id = Rule_id.strip()
+
+        name_pattern = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+        if not name_pattern.match(Container_name):
+            raise HTTPException(status_code=400, detail="Invalid container name. Only letters, numbers, . _ - are allowed.")
+
+        print(f"🔄 Starting container remediation for {Host}/{Container_name} with rule: {Rule_id}")
+
+        # Kiểm tra container tồn tại
+        ssh = ssh_connect(Host, Username, Key_path or "", password=Password)
+        try:
+            check_cmd = f"docker inspect {Container_name} >/dev/null 2>&1"
+            exists = run_bash_check_stdin(
+                ssh,
+                check_cmd,
+                use_sudo=Use_sudo_host,
+                sudo_password=Sudo_password_host,
+                timeout=15,
+            )
+            if exists.get("exit_status") != 0:
+                raise HTTPException(status_code=400, detail=f"Container '{Container_name}' not found on host {Host}")
+        finally:
+            try:
+                ssh.close()
+            except Exception:
+                pass
+
+        # Load remediation script từ scripts/remediation/container-linux/
+        print(f"📄 Loading container remediation script for rule: {Rule_id}")
+        script_content = load_remediation_script("container-linux", Rule_id)
+        if not script_content:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy remediation script cho rule: {Rule_id} trong scripts/remediation/container-linux/",
+            )
+
+        print(f"✅ Script loaded ({len(script_content)} bytes)")
+
+        # Container remediation scripts chạy trên HOST (không phải trong container)
+        # Vì cần restart container với flags mới
+        # Script sẽ nhận CONTAINER_NAME như environment variable
+        host_script = f"""
+export CONTAINER_NAME="{Container_name}"
+
+{script_content}
+"""
+
+        # Thực thi script trên HOST (timeout 2 phút)
+        print(f"🚀 Executing container remediation script on HOST {Host} (will restart container {Container_name} if needed)...")
+        ssh_exec = ssh_connect(Host, Username, Key_path or "", password=Password)
+        try:
+            exec_result = run_bash_check_stdin(
+                ssh_exec,
+                host_script,
+                use_sudo=Use_sudo_host,
+                sudo_password=Sudo_password_host,
+                timeout=120,
+            )
+            # Debug: Print output để kiểm tra
+            stdout_raw = exec_result.get('stdout', '') or ''
+            stderr_raw = exec_result.get('stderr', '') or ''
+            print(f"📊 Script execution result:")
+            print(f"   Exit code: {exec_result.get('exit_status', -1)}")
+            print(f"   Stdout length: {len(stdout_raw)}")
+            print(f"   Stderr length: {len(stderr_raw)}")
+            if stdout_raw:
+                print(f"   Stdout preview (first 500 chars):\n{stdout_raw[:500]}")
+            else:
+                print(f"   ⚠️ WARNING: Stdout is EMPTY!")
+            if stderr_raw:
+                print(f"   Stderr preview (first 500 chars):\n{stderr_raw[:500]}")
+            else:
+                print(f"   ℹ️ Stderr is empty (normal if no errors)")
+        finally:
+            try:
+                ssh_exec.close()
+            except Exception:
+                pass
+
+        # Lưu log remediation
+        # Lấy stdout/stderr trực tiếp (không truncate trong database)
+        stdout_text = stdout_raw.strip() if stdout_raw else ""
+        stderr_text = stderr_raw.strip() if stderr_raw else ""
+        
+        # Debug: Kiểm tra output trước khi lưu
+        print(f"💾 Preparing to save remediation log:")
+        print(f"   Output length: {len(stdout_text)}")
+        print(f"   Error length: {len(stderr_text)}")
+        if stdout_text:
+            print(f"   Output preview: {stdout_text[:200]}...")
+        else:
+            print(f"   ⚠️ WARNING: Output is EMPTY - script may not have produced any output!")
+        
+        remediation_data = {
+            "host": Host,
+            "container": Container_name,
+            "os_type": "container-linux",
+            "client_type": "container",
+            "protocol": "docker-exec",
+            "rule_id": Rule_id,
+            "script_output": stdout_text,  # Lưu full text
+            "script_error": stderr_text,   # Lưu full text
+            "output": stdout_text,  # Field "output" cho dashboard
+            "error": stderr_text,   # Field "error" cho dashboard
+            "exit_code": exec_result.get("exit_status", -1),
+            "backup_id": None,
+            "connection_verified": True,
+            "script_executed": True,
+            "status": "SUCCESS" if exec_result.get("exit_status") == 0 else "PARTIAL",
+        }
+
+        try:
+            remediation_id = db.save_remediation_log(remediation_data)
+            print(f"✅ Container remediation log saved: {remediation_id}")
+            # Debug: Kiểm tra lại data đã lưu
+            saved = db.get_remediation_logs(host=Host, limit=1)
+            if saved:
+                saved_output = saved[0].get("output", "") or saved[0].get("script_output", "")
+                print(f"🔍 Verification: Saved output length = {len(saved_output)}")
+                if saved_output:
+                    print(f"   First 200 chars: {saved_output[:200]}")
+                else:
+                    print(f"   ⚠️ WARNING: Saved output is EMPTY!")
+        except Exception as db_error:
+            print(f"⚠️ MongoDB save failed: {db_error}")
+            import traceback
+            traceback.print_exc()
+            remediation_id = None
+
+        final_status = "SUCCESS" if exec_result.get("exit_status") == 0 else "PARTIAL"
+
+        # Truncate output cho response (không quá 10000 ký tự để tránh response quá lớn)
+        stdout_full = exec_result.get("stdout", "")
+        stderr_full = exec_result.get("stderr", "")
+        
+        return {
+            "remediation_id": remediation_id,
+            "rule_id": Rule_id,
+            "status": final_status,
+            "host": Host,
+            "container": Container_name,
+            "exit_code": exec_result.get("exit_status", -1),
+            "output": stdout_full[:10000],  # Tăng từ 1000 lên 10000
+            "error": stderr_full[:10000],    # Tăng từ 1000 lên 10000
+            "message": f"Container remediation completed with exit code {exec_result.get('exit_status', -1)}",
+            "rollback_available": False,
+            "connection_verified": True,
+            "script_executed": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Container remediation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/healthz")
 async def healthz():
     """Health check endpoint."""
@@ -478,36 +1141,132 @@ async def test_linux_connection(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
 
-# SỬA ENDPOINT REMEDIATION ĐỂ TỰ ĐỘNG TẠO BACKUP
+@app.post("/backups/create/batch", dependencies=[RequireAuth])
+async def create_batch_backup(
+    host: str = Form(...),
+    os_type: str = Form(...),
+    rule_ids: str = Form(..., description="Comma-separated list of rule IDs"),
+    # Linux params
+    Username: Optional[str] = Form(""),
+    Key_path: Optional[str] = Form("~/.ssh/id_ed25519"),
+    Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    # Windows params
+    username: Optional[str] = Form(""),
+    password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+):
+    """Tạo backup chung cho nhiều rules trước khi remediation."""
+    try:
+        rule_ids_list = [r.strip() for r in rule_ids.split(',') if r.strip()]
+        if not rule_ids_list:
+            raise HTTPException(status_code=400, detail="At least one rule_id is required")
+        
+        rule_count = len(rule_ids_list)
+        if rule_count == 1:
+            print(f"🛡️ Creating backup for {host} with 1 rule: {rule_ids_list[0]}")
+        else:
+            print(f"🛡️ Creating backup for {host} with {rule_count} rules")
+        
+        if os_type.startswith('ubuntu') or os_type.startswith('debian'):
+            # Linux backup
+            ssh = ssh_connect(host, Username, Key_path or "", password=Password)
+            try:
+                backup_id = linux_rollback_manager.create_backup_for_rules(
+                    host, Username, Key_path or "", Password, Sudo_password, rule_ids=rule_ids_list
+                )
+            finally:
+                ssh.close()
+            
+            if backup_id:
+                rule_count = len(rule_ids_list)
+                if rule_count == 1:
+                    message = f"Backup created successfully for 1 rule"
+                else:
+                    message = f"Backup created successfully for {rule_count} rules"
+                return {
+                    "status": "SUCCESS",
+                    "backup_id": backup_id,
+                    "host": host,
+                    "rule_ids": rule_ids_list,
+                    "rule_count": rule_count,
+                    "message": message
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to create batch backup")
+        
+        elif os_type.startswith('windows'):
+            # Windows backup
+            session = winrm_connect(host, username or "Administrator", password)
+            # WinRM Session không có method close(), sẽ tự cleanup khi không còn reference
+            backup_id = rollback_manager.create_backup_for_rules(
+                host, session, rule_ids=rule_ids_list
+            )
+            
+            if backup_id:
+                rule_count = len(rule_ids_list)
+                if rule_count == 1:
+                    message = f"Backup created successfully for 1 rule"
+                else:
+                    message = f"Backup created successfully for {rule_count} rules"
+                return {
+                    "status": "SUCCESS",
+                    "backup_id": backup_id,
+                    "host": host,
+                    "rule_ids": rule_ids_list,
+                    "rule_count": rule_count,
+                    "message": message
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to create batch backup")
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported OS type: {os_type}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Batch backup creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Batch backup creation failed: {str(e)}")
+
 @app.post("/remediate/windows", dependencies=[RequireAuth])
 async def remediate_windows(
     host: str = Form(...),
-    username: str = Form("Window"),
+    username: str = Form(""),
     password: str = Form(..., json_schema_extra={"format": "password"}),
-    script_name: str = Form("fix-security-policies.ps1"),
+    rule_id: Optional[str] = Form(None, description="ID của rule cần fix, ví dụ: winrm-cis-windows10-1.1.1"),
+    Rule_id: Optional[str] = Form(None, description="ID của rule cần fix (deprecated, use rule_id)"),
     create_backup: bool = Form(True),
 ):
-    """Chạy remediation script - Tự động tạo backup - Lưu log vào MongoDB."""
+    """Chạy remediation script để fix Windows rule FAIL - Tự động tạo backup - Lưu log vào MongoDB."""
     try:
-        print(f"🔄 Starting remediation for {host} with username: {username}")
+        # Support both rule_id (new) and Rule_id (old) for backward compatibility
+        actual_rule_id = rule_id or Rule_id
+        if not actual_rule_id:
+            raise HTTPException(status_code=400, detail="rule_id is required")
         
-        # Kết nối WinRM (dùng hàm cũ đã hoạt động)
+        print(f"🔄 Starting Windows remediation for {host} with rule: {actual_rule_id}")
+        print(f"   Username: {username}")
+        
+        # Kết nối WinRM
+        print(f"🔌 Step 1: Connecting to {host}...")
         session = winrm_connect(host, username, password)
         print("✅ WinRM connection established")
         
-        # Lấy thông tin host để có os_type (dùng cho cả backup và remediation)
+        # Lấy thông tin host
         host_info = get_windows_host_info(session)
         if host_info["status"] != "SUCCESS":
             raise HTTPException(status_code=400, detail=f"WinRM connection failed: {host_info.get('error', 'Unknown error')}")
-        os_type = host_info.get("os_type", "windows-unknown")
+        os_type = host_info.get("os_type", "windows-10")
+        print(f"✅ Host info: {os_type}")
         
+        # Tạo backup nếu được yêu cầu
         backup_id = None
-        
-        # Tạo backup nếu được yêu cầu - KHÔNG BLOCK NẾU LỖI
         if create_backup:
             try:
-                print("🔍 Creating backup...")
-                backup_id = rollback_manager.create_backup(host, session)
+                print("🔍 Creating rule-specific backup...")
+                backup_id = rollback_manager.create_backup(host, session, rule_id=actual_rule_id)
                 if backup_id:
                     print(f"✅ Backup created: {backup_id}")
                 else:
@@ -516,19 +1275,17 @@ async def remediate_windows(
                 print(f"⚠️ Backup creation failed (non-critical): {backup_error}")
                 # KHÔNG RAISE ERROR - tiếp tục remediation
         
-        # Load script từ file
-        print(f"📄 Loading script: {script_name}")
-        try:
-            script_content = load_windows_remediation_script(script_name)
-            if not script_content:
-                raise HTTPException(status_code=404, detail=f"Remediation script not found: {script_name}. Check if file exists in scripts/remediation/window-10/")
-        except Exception as load_error:
-            error_msg = f"Failed to load script {script_name}: {str(load_error)}"
-            print(f"❌ {error_msg}")
-            raise HTTPException(status_code=500, detail=error_msg)
+        # Load remediation script
+        print(f"📄 Step 2: Loading remediation script for rule: {actual_rule_id}")
+        script_content = load_windows_remediation_script(actual_rule_id)
+        if not script_content:
+            raise HTTPException(status_code=404, detail=f"Không tìm thấy remediation script cho rule: {actual_rule_id}")
+        print(f"✅ Script loaded ({len(script_content)} bytes)")
         
-        # Chạy script remediation
-        print("🚀 Running remediation script...")
+        # Chạy script remediation với timeout 5 phút
+        print(f"🚀 Step 3: Executing remediation script on {host}...")
+        print(f"   Timeout: 300 seconds")
+        
         try:
             result = session.run_ps(script_content)
         except Exception as exec_error:
@@ -536,28 +1293,83 @@ async def remediate_windows(
             print(f"❌ {error_msg}")
             raise HTTPException(status_code=500, detail=error_msg)
         
-        # Normalize line endings và decode output
+        # Parse output
         output = result.std_out.decode('utf-8', errors='ignore').replace('\r\n', '\n').replace('\r', '\n').strip()
         error = result.std_err.decode('utf-8', errors='ignore').replace('\r\n', '\n').replace('\r', '\n').strip()
+        exit_code = result.status_code
         
-        print(f"📊 Script result - Exit code: {result.status_code}")
-        if output:
-            print(f"   Output length: {len(output)} characters")
-        if error:
-            print(f"   Error output: {error[:200]}...")
+        print(f"📊 Script result - Exit code: {exit_code}")
         
-        # Chuẩn bị dữ liệu remediation để lưu vào MongoDB
+        # VERIFY: Chạy lại check command để xác nhận đã fix
+        print(f"🔍 Step 4: Verifying remediation on {host}...")
+        verification_passed = False
+        verification_output = ""
+        verification_error = ""
+        
+        try:
+            # Load rule để lấy check command
+            rules = load_rules(os_type=os_type)
+            rule = next((r for r in rules if r.get("id") == actual_rule_id), None)
+            
+            if rule and rule.get("check", {}).get("winrm"):
+                check_command = rule["check"]["winrm"]
+                expected_output = rule["check"].get("expected", "")
+                print(f"   Check command: {check_command[:100]}...")
+                print(f"   Expected output containing: {expected_output}")
+                
+                verify_result = session.run_cmd(check_command)
+                verification_output = verify_result.std_out.decode('utf-8', errors='ignore').strip()
+                verification_error = verify_result.std_err.decode('utf-8', errors='ignore').strip()
+                
+                # Normalize for comparison (case-insensitive, whitespace normalized)
+                output_normalized = verification_output.lower().strip()
+                expected_normalized = expected_output.lower().strip() if expected_output else ""
+                
+                # Check verification - same logic as audit
+                if expected_normalized:
+                    # Direct match
+                    if expected_normalized in output_normalized:
+                        verification_passed = (verify_result.status_code == 0)
+                    else:
+                        # Try to find pattern like "key = value" or "key=value" or "key value"
+                        import re
+                        pattern = re.compile(r'[=:\s]+' + re.escape(expected_normalized) + r'(?:\s|$|,|;|\)|])', re.IGNORECASE)
+                        verification_passed = (verify_result.status_code == 0 and pattern.search(output_normalized) is not None)
+                else:
+                    # If no expected value, just check exit code
+                    verification_passed = (verify_result.status_code == 0)
+                
+                if verification_passed:
+                    print(f"✅ Verification PASSED - Rule '{actual_rule_id}' is FIXED")
+                    print(f"   Output: {verification_output[:200]}")
+                else:
+                    print(f"⚠️ Verification FAILED - Rule '{actual_rule_id}' may still exist")
+                    print(f"   Exit code: {verify_result.status_code}")
+                    print(f"   Expected: {expected_output}")
+                    print(f"   Output: {verification_output[:200]}")
+                    print(f"   Error: {verification_error[:200] if verification_error else 'None'}")
+            else:
+                print("⚠️ No check command found in rule for verification")
+        except Exception as verify_error:
+            print(f"❌ Verification check failed: {verify_error}")
+            import traceback
+            traceback.print_exc()
+        
+        # Chuẩn bị dữ liệu remediation
         remediation_data = {
             "host": host,
             "username": username,
             "os_type": os_type,
+            "rule_id": actual_rule_id,
             "client_type": "windows",
-            "script_used": script_name,
             "backup_id": backup_id,
-            "status": "SUCCESS" if result.status_code == 0 else "PARTIAL",
-            "exit_code": result.status_code,
+            "status": "SUCCESS" if (exit_code == 0 and verification_passed) else "PARTIAL",
+            "exit_code": exit_code,
             "output": output,
             "error": error,
+            "verification_passed": verification_passed,
+            "verification_output": verification_output,
+            "verification_error": verification_error,
             "rollback_status": "AVAILABLE" if backup_id else "NO_BACKUP",
             "created_at": datetime.utcnow()
         }
@@ -571,76 +1383,190 @@ async def remediate_windows(
             print(f"⚠️ MongoDB save failed (non-critical): {db_error}")
             remediation_id = None
         
+        # Determine final status
+        if exit_code == 0 and verification_passed:
+            final_status = "SUCCESS"
+            message = f"✅ Remediation successful - Rule '{actual_rule_id}' is FIXED and VERIFIED on {host}"
+        elif exit_code == 0:
+            final_status = "PARTIAL"
+            message = f"⚠️ Script completed but verification FAILED - Rule '{actual_rule_id}' may still exist on {host}"
+        else:
+            final_status = "PARTIAL"
+            message = f"⚠️ Script failed (exit code {exit_code}) - Rule '{actual_rule_id}' may not be fixed on {host}"
+        
+        print(f"📋 Final Status: {final_status}")
+        print(f"   Script exit code: {exit_code}")
+        print(f"   Verification passed: {verification_passed}")
+        print(f"   Message: {message}")
+        
         return {
             "remediation_id": remediation_id,
+            "rule_id": actual_rule_id,
             "backup_id": backup_id,
-            "status": "SUCCESS" if result.status_code == 0 else "PARTIAL",
+            "status": final_status,
             "host": host,
             "os_type": os_type,
-            "script_used": script_name,
-            "exit_code": result.status_code,
-            "output": output[:1000] if output else "",
-            "error": error[:1000] if error else "",
-            "message": f"Remediation script '{script_name}' executed successfully" if result.status_code == 0 else f"Remediation script '{script_name}' completed with exit code {result.status_code}",
-            "rollback_available": backup_id is not None
+            "exit_code": exit_code,
+            "output": output[:1000],
+            "error": error[:1000],
+            "verification_passed": verification_passed,
+            "verification_output": verification_output[:500] if verification_output else "",
+            "verification_error": verification_error[:500] if verification_error else "",
+            "message": message,
+            "rollback_available": backup_id is not None,
+            "connection_verified": True,
+            "script_executed": True,
+            "verification_performed": True
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = f"Remediation failed: {str(e)}"
-        print(f"❌ {error_msg}")
+        print(f"❌ Remediation failed: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/rollback/windows", dependencies=[RequireAuth])
+@app.post("/rollback/windows", dependencies=[RequireAdmin])
 async def rollback_windows(
     host: str = Form(...),
-    username: str = Form("Window"),  # SỬA: "Administrator" → "Window"
+    username: str = Form(""),
     password: str = Form(..., json_schema_extra={"format": "password"}),
     backup_id: Optional[str] = Form(None),
+    rule_id: Optional[str] = Form(None),  # Thêm tham số rule_id
 ):
-    """Rollback Windows system về trạng thái trước khi remediation."""
+    """Rollback Windows system về trạng thái trước khi remediation (có thể theo rule_id)."""
     try:
         print(f"🔄 Starting rollback for {host} with username: {username}")
+        if rule_id:
+            print(f"   Rule ID specified: {rule_id}")
+        if backup_id:
+            print(f"   Backup ID specified: {backup_id}")
         
         session = winrm_connect(host, username, password)
         print("✅ WinRM connection established")
         
-        result = rollback_manager.execute_rollback(host, session, backup_id)
+        # Sử dụng rollback manager mới với rule_id
+        result = rollback_manager.execute_rollback(host, session, backup_id, rule_id)
         
         return {
             "status": result.get("status", "SUCCESS"),
             "message": result.get("message", "Rollback completed successfully"),
             "host": host,
             "backup_id": result.get("backup_id"),
-            "rollback_details": result.get("rollback_details", {})
+            "rule_id": result.get("rule_id"),
+            "backup_type": result.get("backup_type"),
+            "rollback_details": result.get("rollback_details", {}),
+            "summary": result.get("summary", {}),
+            "error": result.get("error")  # Include error code if any
         }
         
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Rollback failed: {e}")
+        import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Rollback failed: {str(e)}")
+
+@app.get("/backups/windows/rule/{rule_id}", dependencies=[RequireAuth])
+async def get_windows_backups_by_rule(
+    rule_id: str,
+    host: Optional[str] = None,
+    limit: int = 20
+):
+    """Lấy danh sách backups cho một rule cụ thể - hỗ trợ cả single và batch backups."""
+    try:
+        # Query hỗ trợ cả single rule backup và batch backup chứa rule này
+        query = {
+            "os_type": "windows",
+            "type": "pre_remediation_backup",
+            "$or": [
+                {"rule_id": rule_id},  # Single rule backup
+                {"rule_ids": rule_id}  # Batch backup chứa rule này
+            ]
+        }
+        if host:
+            query["host"] = host
+        
+        backups = list(db.backups.find(query).sort("timestamp", -1).limit(limit))
+        for backup in backups:
+            backup["_id"] = str(backup["_id"])
+        
+        return {
+            "total": len(backups),
+            "rule_id": rule_id,
+            "host": host,
+            "backups": backups
+        }
+    except Exception as e:
+        print(f"❌ Error getting Windows backups by rule {rule_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get backups: {str(e)}")
+
+@app.get("/backups/linux/rule/{rule_id}", dependencies=[RequireAuth])
+async def get_linux_backups_by_rule(
+    rule_id: str,
+    host: Optional[str] = None,
+    limit: int = 20
+):
+    """Lấy danh sách backups cho một rule cụ thể - hỗ trợ cả single và batch backups."""
+    try:
+        # Query hỗ trợ cả single rule backup và batch backup chứa rule này
+        query = {
+            "os_type": "linux",
+            "type": "pre_remediation_backup",
+            "$or": [
+                {"rule_id": rule_id},  # Single rule backup
+                {"rule_ids": rule_id}  # Batch backup chứa rule này
+            ]
+        }
+        if host:
+            query["host"] = host
+        
+        backups = list(db.backups.find(query).sort("timestamp", -1).limit(limit))
+        for backup in backups:
+            backup["_id"] = str(backup["_id"])
+        
+        return {
+            "total": len(backups),
+            "rule_id": rule_id,
+            "host": host,
+            "backups": backups
+        }
+    except Exception as e:
+        print(f"❌ Error getting Linux backups by rule {rule_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get backups: {str(e)}")
 
 @app.get("/backups/windows", dependencies=[RequireAuth])
 async def get_windows_backups(host: Optional[str] = None):
-    """Lấy danh sách backups Windows."""
+    """Lấy danh sách rule backups Windows (chỉ pre_remediation_backup)."""
     try:
         if host:
             backups = rollback_manager.get_backups(host)
         else:
-            backups = db.get_backups_not_linux(limit=50)
+            # Chỉ lấy rule backups, không lấy system backups
+            backups = list(db.backups.find(
+                {
+                    "os_type": "windows",
+                    "type": "pre_remediation_backup"
+                },
+                sort=[("timestamp", -1)]
+            ).limit(50))
             for backup in backups:
                 backup["_id"] = str(backup["_id"])
         
         return {"total": len(backups), "backups": backups}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error getting Windows backups: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get backups: {str(e)}")
 
-@app.post("/rollback/linux", dependencies=[RequireAuth])
+@app.post("/rollback/linux", dependencies=[RequireAdmin])
 async def rollback_linux(
     Host: str = Form(...),
     Username: str = Form(""),
@@ -648,13 +1574,18 @@ async def rollback_linux(
     Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
     Sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
     backup_id: Optional[str] = Form(None),
+    rule_id: Optional[str] = Form(None),  # Thêm tham số rule_id
 ):
-    """Rollback Linux system về trạng thái trước khi remediation."""
+    """Rollback Linux system về trạng thái trước khi remediation (có thể theo rule_id)."""
     try:
         print(f"🔄 Starting rollback for Linux host: {Host}")
+        if rule_id:
+            print(f"   Rule ID specified: {rule_id}")
+        if backup_id:
+            print(f"   Backup ID specified: {backup_id}")
         
         result = linux_rollback_manager.execute_rollback(
-            Host, Username, Key_path or "", Password, Sudo_password, backup_id
+            Host, Username, Key_path or "", Password, Sudo_password, backup_id, rule_id
         )
         
         return {
@@ -662,22 +1593,36 @@ async def rollback_linux(
             "message": result.get("message", "Rollback completed successfully"),
             "host": Host,
             "backup_id": result.get("backup_id"),
-            "rollback_details": result.get("rollback_details", {})
+            "rule_id": result.get("rule_id"),
+            "rollback_details": result.get("rollback_details", {}),
+            "error": result.get("error")  # Include error code if any
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Rollback failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Rollback failed: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/backups/linux", dependencies=[RequireAuth])
 async def get_linux_backups(host: Optional[str] = None):
-    """Lấy danh sách backups Linux."""
+    """Lấy danh sách rule backups Linux (chỉ pre_remediation_backup)."""
     try:
         if host:
             backups = linux_rollback_manager.get_backups(host)
         else:
-            backups = db.get_backups_by_os_type("linux", limit=50)
+            # Chỉ lấy rule backups, không lấy system backups
+            backups = list(db.backups.find(
+                {
+                    "os_type": "linux",
+                    "type": "pre_remediation_backup"
+                },
+                sort=[("timestamp", -1)]
+            ).limit(50))
             for backup in backups:
                 backup["_id"] = str(backup["_id"])
         
@@ -685,7 +1630,269 @@ async def get_linux_backups(host: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/remediate/linux", dependencies=[RequireAuth])
+@app.delete("/backups/{backup_id}", dependencies=[RequireAdmin])
+async def delete_backup(backup_id: str):
+    """Xóa một backup theo backup_id."""
+    try:
+        success = db.delete_backup(backup_id)
+        if success:
+            return {
+                "status": "success",
+                "message": f"Backup {backup_id} deleted successfully",
+                "backup_id": backup_id
+            }
+        else:
+            raise HTTPException(status_code=404, detail=f"Backup {backup_id} not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Failed to delete backup: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backups/cleanup", dependencies=[RequireAdmin])
+async def cleanup_old_backups(days: int = 7):
+    """Xóa các backup cũ hơn số ngày chỉ định (mặc định 7 ngày)."""
+    try:
+        deleted_count = db.cleanup_old_backups(days=days)
+        return {
+            "status": "success",
+            "message": f"Cleaned up {deleted_count} backups older than {days} days",
+            "deleted_count": deleted_count,
+            "days": days
+        }
+    except Exception as e:
+        print(f"❌ Failed to cleanup old backups: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backups/system/linux", dependencies=[RequireAdmin])
+async def create_system_backup_linux(
+    Host: str = Form(...),
+    Username: str = Form(""),
+    Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    backup_ssh_config: Optional[str] = Form("true"),
+    backup_users_groups: Optional[str] = Form("true"),
+    backup_network_config: Optional[str] = Form("true"),
+    backup_security_config: Optional[str] = Form("true"),
+    backup_system_services: Optional[str] = Form("true"),
+    backup_firewall_config: Optional[str] = Form("true"),
+    backup_logging_config: Optional[str] = Form("true"),
+    backup_system_info: Optional[str] = Form("true"),
+):
+    """Create independent system backup for Linux - backup important system files."""
+    try:
+        backup_options = {
+            "ssh_config": backup_ssh_config.lower() == "true",
+            "users_groups": backup_users_groups.lower() == "true",
+            "network_config": backup_network_config.lower() == "true",
+            "security_config": backup_security_config.lower() == "true",
+            "system_services": backup_system_services.lower() == "true",
+            "firewall_config": backup_firewall_config.lower() == "true",
+            "logging_config": backup_logging_config.lower() == "true",
+            "system_info": backup_system_info.lower() == "true",
+        }
+        backup_id = system_backup_manager.create_linux_system_backup(
+            Host, Username, "", Password, Sudo_password, backup_options
+        )
+        if backup_id:
+            return {
+                "status": "success",
+                "message": f"System backup created successfully for {Host}",
+                "backup_id": backup_id,
+                "host": Host
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create system backup")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ System backup failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backups/system/windows", dependencies=[RequireAdmin])
+async def create_system_backup_windows(
+    host: str = Form(...),
+    username: str = Form("Administrator"),
+    password: str = Form(..., json_schema_extra={"format": "password"}),
+    backup_ssh_config: Optional[str] = Form("true"),  # Registry keys
+    backup_users_groups: Optional[str] = Form("true"),  # Security policies
+    backup_firewall_config: Optional[str] = Form("true"),
+    backup_system_info: Optional[str] = Form("true"),
+):
+    """Create independent system backup for Windows - backup important system configurations."""
+    try:
+        backup_options = {
+            "registry_keys": backup_ssh_config.lower() == "true",
+            "security_policies": backup_users_groups.lower() == "true",
+            "firewall_rules": backup_firewall_config.lower() == "true",
+            "system_info": backup_system_info.lower() == "true",
+        }
+        backup_id = system_backup_manager.create_windows_system_backup(
+            host, username, password, backup_options
+        )
+        if backup_id:
+            return {
+                "status": "success",
+                "message": f"System backup created successfully for {host}",
+                "backup_id": backup_id,
+                "host": host
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create system backup")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ System backup failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backups/system/restore", dependencies=[RequireAdmin])
+async def restore_system_backup(
+    backup_id: str = Form(...),
+    Host: str = Form(...),
+    Username: str = Form(""),
+    Key_path: Optional[str] = Form("~/.ssh/id_ed25519"),
+    Password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    Sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    username: Optional[str] = Form(None),  # Windows username
+    password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),  # Windows password
+):
+    """Restore system backup to a host."""
+    try:
+        # Determine if this is Windows or Linux based on backup
+        backup = db.backups.find_one({"backup_id": backup_id, "type": "system_backup"})
+        if not backup:
+            raise HTTPException(status_code=404, detail=f"Backup {backup_id} not found")
+        
+        os_type = backup.get("os_type", "linux")
+        
+        if os_type == "windows":
+            if not username or not password:
+                raise HTTPException(status_code=400, detail="Windows username and password are required")
+            # For Windows, pass password as sudo_password parameter (hack to reuse method signature)
+            result = system_backup_manager.restore_system_backup(
+                backup_id, Host, username, "", None, password
+            )
+        else:
+            result = system_backup_manager.restore_system_backup(
+                backup_id, Host, Username, Key_path or "", Password, Sudo_password
+            )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ System backup restore failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/backups/system", dependencies=[RequireAuth])
+async def get_system_backups(host: Optional[str] = None, os_type: Optional[str] = None):
+    """Get system backups (not rule backups)."""
+    try:
+        query = {"type": "system_backup"}
+        if host:
+            query["host"] = host
+        if os_type:
+            query["os_type"] = os_type
+        
+        backups = list(db.backups.find(query).sort("timestamp", -1).limit(50))
+        for backup in backups:
+            backup["_id"] = str(backup["_id"])
+        
+        return {"total": len(backups), "backups": backups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backups/schedules", dependencies=[RequireAdmin])
+async def create_backup_schedule(
+    host: str = Form(...),
+    osType: str = Form(...),
+    username: str = Form(""),
+    key_path: Optional[str] = Form("~/.ssh/id_ed25519"),
+    password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+    scheduleType: str = Form(...),  # daily, weekly, monthly
+    time: str = Form(...),  # HH:MM format
+    enabled: bool = Form(True)
+):
+    """Create a scheduled system backup."""
+    try:
+        schedule_data = {
+            "host": host,
+            "osType": osType,
+            "username": username,
+            "key_path": key_path,
+            "password": password,
+            "sudo_password": sudo_password,
+            "scheduleType": scheduleType,
+            "time": time,
+            "enabled": enabled
+        }
+        schedule_id = db.save_backup_schedule(schedule_data)
+        return {
+            "status": "success",
+            "message": "Backup schedule created successfully",
+            "schedule_id": schedule_id
+        }
+    except Exception as e:
+        print(f"❌ Failed to create schedule: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/backups/schedules", dependencies=[RequireAuth])
+async def get_backup_schedules():
+    """Get all backup schedules."""
+    try:
+        schedules = db.get_backup_schedules()
+        return {"total": len(schedules), "schedules": schedules}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/backups/schedules/{schedule_id}", dependencies=[RequireAdmin])
+async def delete_backup_schedule(schedule_id: str):
+    """Delete a backup schedule."""
+    try:
+        success = db.delete_backup_schedule(schedule_id)
+        if success:
+            return {"status": "success", "message": "Schedule deleted successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/backups/schedules/{schedule_id}", dependencies=[RequireAdmin])
+async def update_backup_schedule(
+    schedule_id: str,
+    enabled: Optional[bool] = Form(None)
+):
+    """Update a backup schedule."""
+    try:
+        update_data = {}
+        if enabled is not None:
+            update_data["enabled"] = enabled
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No update data provided")
+        
+        success = db.update_backup_schedule(schedule_id, update_data)
+        if success:
+            return {"status": "success", "message": "Schedule updated successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/remediate/linux", dependencies=[RequireAdmin])
 async def remediate_linux(
     Host: str = Form(...),
     Username: str = Form(""),
@@ -695,7 +1902,7 @@ async def remediate_linux(
     Sudo_password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
     Rule_id: str = Form(..., description="ID của rule cần fix, ví dụ: cis-ubuntu-20.04-5.2.4"),
     create_backup: bool = Form(True),
-):
+): 
     """Chạy remediation script để fix rule FAIL - Tự động tạo backup - Lưu log vào MongoDB."""
     try:
         print(f"🔄 Starting Linux remediation for {Host} with rule: {Rule_id}")
@@ -730,7 +1937,7 @@ async def remediate_linux(
             try:
                 print("🔍 Creating backup...")
                 backup_id = linux_rollback_manager.create_backup(
-                    Host, Username, Key_path or "", Password, Sudo_password
+                    Host, Username, Key_path or "", Password, Sudo_password, rule_id=Rule_id
                 )
                 if backup_id:
                     print(f"✅ Backup created: {backup_id}")
@@ -832,7 +2039,6 @@ async def remediate_linux(
                 print("⚠️ No check command found in rule for verification")
         except Exception as verify_error:
             print(f"❌ Verification check failed: {verify_error}")
-            import traceback
             traceback.print_exc()
         
         # Chuẩn bị dữ liệu remediation để lưu vào MongoDB
@@ -919,6 +2125,7 @@ async def get_audit_reports(
     Filter: có thể filter theo host và os_type
     """
     try:
+        total = db.count_audit_reports(host=host)
         audits = db.get_audit_reports(host=host, limit=limit)
         
         # Filter by OS type if provided
@@ -931,7 +2138,7 @@ async def get_audit_reports(
             del audit["_id"]
             
         return {
-            "total": len(audits),
+            "total": total,
             "audits": audits
         }
     except Exception as e:
@@ -949,15 +2156,90 @@ async def get_remediation_reports(
     Filter: có thể filter theo host
     """
     try:
+        total = db.count_remediation_logs(host=host)
         remediations = db.get_remediation_logs(host=host, limit=limit)
         
+        # Convert ObjectId to string và đảm bảo format đúng
         for remediation in remediations:
-            remediation["id"] = str(remediation["_id"])
-            del remediation["_id"]
+            if "_id" in remediation:
+                remediation["id"] = str(remediation["_id"])
+                del remediation["_id"]
+            # Đảm bảo có các field cần thiết
+            if "remediation_id" not in remediation and "id" in remediation:
+                remediation["remediation_id"] = remediation["id"]
             
+            # FIX: Đảm bảo output/error là STRING, không phải dict
+            # Nếu là dict (từ truncate_output), extract text
+            def extract_text(value):
+                """Extract text từ value - có thể là string hoặc dict {text, truncated}"""
+                if value is None:
+                    return ""
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, dict):
+                    # Nếu là dict từ truncate_output, lấy text
+                    return value.get("text", "") if "text" in value else str(value)
+                return str(value)
+            
+            # Xử lý script_output và script_error trước
+            if "script_output" in remediation:
+                remediation["script_output"] = extract_text(remediation["script_output"])
+            if "script_error" in remediation:
+                remediation["script_error"] = extract_text(remediation["script_error"])
+            
+            # Đảm bảo output và error fields tồn tại (fallback từ script_output/script_error)
+            if "output" not in remediation:
+                remediation["output"] = extract_text(remediation.get("script_output", ""))
+            else:
+                remediation["output"] = extract_text(remediation["output"])
+                
+            if "error" not in remediation:
+                remediation["error"] = extract_text(remediation.get("script_error", ""))
+            else:
+                remediation["error"] = extract_text(remediation["error"])
+        
+        print(f"📊 GET /reports/remediations - Returning {len(remediations)} remediations (total: {total})")
+        
         return {
-            "total": len(remediations),
+            "total": total,
             "remediations": remediations
+        }
+    except Exception as e:
+        print(f"❌ Error in get_remediation_reports: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+class BulkDeleteRequest(BaseModel):
+    ids: List[str]
+
+@app.post("/remediations/bulk-delete", dependencies=[RequireAdmin])
+async def bulk_delete_remediations(request: BulkDeleteRequest):
+    """Xóa nhiều remediation logs theo danh sách IDs."""
+    try:
+        if not request.ids or len(request.ids) == 0:
+            raise HTTPException(status_code=400, detail="No IDs provided")
+        
+        deleted_count = db.bulk_delete_remediations(request.ids)
+        return {
+            "status": "success",
+            "message": f"Deleted {deleted_count} remediation(s)",
+            "deleted_count": deleted_count
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/database/clear-data", dependencies=[RequireAdmin])
+async def clear_all_data():
+    """Xóa tất cả dữ liệu audit, remediation, backup, schedules. Giữ lại users và api_keys."""
+    try:
+        deleted_counts = db.clear_all_data()
+        return {
+            "status": "success",
+            "message": "All data cleared successfully",
+            "deleted_counts": deleted_counts
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1016,7 +2298,169 @@ async def get_audit_detail(audit_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== AUTHENTICATION ENDPOINTS ====================
+# ==================== USER AUTHENTICATION ENDPOINTS ====================
+
+@app.post("/auth/users/register")
+async def register_user(
+    username: str = Form(...),
+    password: str = Form(..., json_schema_extra={"format": "password"}),
+    email: str = Form(""),
+):
+    """Đăng ký user mới. Chỉ cho phép khi chưa có user nào (first user sẽ là admin)."""
+    try:
+        # Chỉ cho phép đăng ký khi chưa có user nào
+        if user_manager.has_any_users():
+            raise HTTPException(
+                status_code=403, 
+                detail="Registration is only allowed for the first user. Please contact an admin to create new users."
+            )
+        
+        # First user is always admin
+        role = "admin"
+        
+        # Create user
+        user = user_manager.create_user(username, password, email, role)
+        return {
+            "status": "success",
+            "message": "User created successfully",
+            "user": user
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/auth/users", dependencies=[RequireAdmin])
+async def list_users():
+    """Lấy danh sách users. Admin only."""
+    try:
+        users = user_manager.list_users()
+        return {"total": len(users), "users": users}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auth/users/create", dependencies=[RequireAdmin])
+async def create_user_by_admin(
+    username: str = Form(...),
+    password: str = Form(..., json_schema_extra={"format": "password"}),
+    email: str = Form(""),
+):
+    """Admin tạo user mới. Không cần API key trong parameter, check qua RequireAdmin dependency."""
+    try:
+        # Force role to be 'user' (không cho phép tạo admin)
+        role = "user"
+        
+        # Create user
+        user = user_manager.create_user(username, password, email, role)
+        return {
+            "status": "success",
+            "message": "User created successfully",
+            "user": user
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/auth/users/{username}", dependencies=[RequireAdmin])
+async def update_user(
+    username: str,
+    email: Optional[str] = Form(None),
+    password: Optional[str] = Form(None, json_schema_extra={"format": "password"}),
+):
+    """Cập nhật thông tin user (email, password). Admin only."""
+    try:
+        user = user_manager.update_user(username, email=email, password=password)
+        return {
+            "status": "success",
+            "message": "User updated successfully",
+            "user": user
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/auth/users/{username}", dependencies=[RequireAdmin])
+async def delete_user(username: str):
+    """Xóa user (soft delete). Admin only."""
+    try:
+        user_manager.delete_user(username)
+        return {
+            "status": "success",
+            "message": "User deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/auth/users/{username}/role", dependencies=[RequireAdmin])
+async def change_user_role(
+    username: str,
+    role: str = Form(...),
+):
+    """Thay đổi role của user. Admin only. Không cho phép tạo thêm admin."""
+    try:
+        if role not in ["admin", "user"]:
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'admin' or 'user'")
+        
+        user = user_manager.change_role(username, role)
+        return {
+            "status": "success",
+            "message": "User role updated successfully",
+            "user": user
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auth/users/login")
+async def login_user(
+    username: str = Form(...),
+    password: str = Form(..., json_schema_extra={"format": "password"}),
+):
+    """Đăng nhập user và trả về API key tạm thời."""
+    try:
+        if not user_manager.verify_user(username, password):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password"
+            )
+        
+        # Tạo API key tạm thời cho user này (hoặc có thể dùng JWT token)
+        # Ở đây tạm thời tạo API key với tên user
+        api_key_data = auth_manager.generate_api_key(
+            name=f"User: {username}",
+            description=f"Temporary API key for {username}",
+            expires_days=30
+        )
+        
+        user_info = user_manager.get_user(username)
+        
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "api_key": api_key_data["api_key"],
+            "user": user_info,
+            "expires_at": api_key_data["expires_at"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/auth/users/me", dependencies=[RequireAuth])
+async def get_current_user():
+    """Lấy thông tin user hiện tại (cần API key)."""
+    # Note: Cần implement logic để map API key với user
+    # Tạm thời trả về thông tin cơ bản
+    return {
+        "message": "User info endpoint - to be implemented with API key to user mapping"
+    }
+
+# ==================== API KEY AUTHENTICATION ENDPOINTS ====================
 
 @app.post("/auth/setup")
 async def setup_first_api_key(
@@ -1137,8 +2581,49 @@ async def reset_all_api_keys(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/version")
 async def version():
     """Version endpoint."""
     return {"name": "security_hardening", "api": "v1"}
+
+# ==================== DASHBOARD ROUTES (Must be last to avoid conflicts) ====================
+
+# Serve React dashboard at root (only if built)
+# This must be registered AFTER all API routes
+if DASHBOARD_BUILT:
+    @app.get("/", name="serve_dashboard_root")
+    async def serve_dashboard_root():
+        """Serve React dashboard at root."""
+        index_path = os.path.join(DASHBOARD_DIST, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        # Fallback to API info if index.html not found
+        return await root_api_info()
+    
+    # Serve dashboard at /dashboard as well for backward compatibility
+    @app.get("/dashboard", name="serve_dashboard_base")
+    @app.get("/dashboard/{path:path}", name="serve_dashboard_path")
+    async def serve_dashboard_route(path: str = ""):
+        """Serve React dashboard at /dashboard route (for SPA routing)."""
+        index_path = os.path.join(DASHBOARD_DIST, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return await root_api_info()
+    
+    # Catch-all for React Router (must be last route)
+    # This handles all non-API routes like /hosts, /audits, etc.
+    @app.get("/{path:path}", name="serve_dashboard_spa")
+    async def serve_dashboard_spa(path: str):
+        """Catch-all route for React SPA routing (handles /hosts, /audits, etc.)."""
+        # Skip if it's an API route or static file
+        if path.startswith(("api/", "docs", "redoc", "openapi.json", "healthz", "version", 
+                           "audit/", "remediate/", "rollback/", "reports/", "auth/", 
+                           "backups/", "rules", "test/", "assets/")):
+            raise HTTPException(status_code=404, detail="Not found")
+        
+        # Serve React dashboard for all other routes
+        index_path = os.path.join(DASHBOARD_DIST, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
